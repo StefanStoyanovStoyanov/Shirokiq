@@ -3,20 +3,38 @@ import json
 import logging
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlsplit
 
 import discord
 import spotipy
-from discord import app_commands
 from discord.ext import commands
 from spotipy.oauth2 import SpotifyClientCredentials
 from yt_dlp import YoutubeDL
 
 logger = logging.getLogger(__name__)
 
+
+class YTDLLogger:
+    def debug(self, message: str) -> None:
+        logger.debug(message)
+
+    def info(self, message: str) -> None:
+        logger.info(message)
+
+    def warning(self, message: str) -> None:
+        if "Unable to recognize playlist. Downloading just video" not in message:
+            logger.warning("%s", message)
+
+    def error(self, message: str) -> None:
+        logger.error("%s", message)
+
+
 YTDL_FORMAT_OPTIONS = {
     "format": "bestaudio/best",
-    "noplaylist": True,
+    "noplaylist": False,
     "quiet": True,
+    "logger": YTDLLogger(),
+    "js_runtimes": {"node": {}},
     "source_address": "0.0.0.0",
     "prefer_ffmpeg": True,
     "http_headers": {
@@ -36,32 +54,98 @@ ytdl = YoutubeDL(YTDL_FORMAT_OPTIONS)
 
 
 class SpotifyHelper:
-    def __init__(self, client_id: str, client_secret: str):
+    def __init__(self, client_id: str, client_secret: str, market: str = "US"):
         auth_manager = SpotifyClientCredentials(
             client_id=client_id, client_secret=client_secret
         )
         self.client = spotipy.Spotify(auth_manager=auth_manager)
+        self.market = market.upper()
 
     def extract_tracks(self, url: str) -> list[str]:
-        if "/track/" in url:
-            track = self.client.track(url)
-            return [self._format_track(track)] if track.get("artists") else []
-
-        if "/playlist/" in url:
-            page = self.client.playlist_items(url)
-        elif "/album/" in url:
-            page = self.client.album_tracks(url)
-        else:
+        resource_type, resource_id = self._parse_resource(url)
+        if resource_type is None or resource_id is None:
             return []
 
+        if resource_type == "track":
+            return self._track_query(self.client.track(resource_id))
+
+        if resource_type == "artist":
+            albums = self._get_all_items(
+                self.client.artist_albums(
+                    resource_id,
+                    include_groups="album,single,compilation,appears_on",
+                    country=self.market,
+                    limit=50,
+                )
+            )
+            pages = (
+                self.client.album_tracks(album["id"], limit=50)
+                for album in albums
+                if album.get("id")
+            )
+        elif resource_type == "album":
+            pages = (self.client.album_tracks(resource_id, limit=50),)
+        else:
+            pages = (self.client.playlist_items(resource_id, limit=100),)
+
         tracks = []
-        while page:
-            for item in page.get("items", []):
+        seen_ids = set()
+        for page in pages:
+            for item in self._get_all_items(page):
                 track = item.get("track", item)
-                if track and track.get("artists"):
-                    tracks.append(self._format_track(track))
-            page = self.client.next(page) if page.get("next") else None
+                if not track or not track.get("artists"):
+                    continue
+                track_id = track.get("id")
+                if track_id and track_id in seen_ids:
+                    continue
+                if track_id:
+                    seen_ids.add(track_id)
+                tracks.extend(self._track_query(track))
         return tracks
+
+    def _get_all_items(self, page: dict[str, Any]) -> list[dict[str, Any]]:
+        items = []
+        while page:
+            items.extend(page.get("items", []))
+            page = self.client.next(page) if page.get("next") else None
+        return items
+
+    @staticmethod
+    def _track_query(track: dict[str, Any]) -> list[str]:
+        if not track or not track.get("artists") or not track.get("name"):
+            return []
+        return [SpotifyHelper._format_track(track)]
+
+    @staticmethod
+    def _parse_resource(url: str) -> tuple[Optional[str], Optional[str]]:
+        if url.startswith("spotify:"):
+            parts = url.split(":")
+            if len(parts) >= 3 and parts[1] in {
+                "track",
+                "album",
+                "playlist",
+                "artist",
+            }:
+                return parts[1], parts[2]
+            return None, None
+
+        parsed = urlsplit(url if "://" in url else f"https://{url}")
+        host = (parsed.hostname or "").lower()
+        if host != "spotify.com" and not host.endswith(".spotify.com"):
+            return None, None
+        parts = [part for part in parsed.path.split("/") if part]
+        for index, part in enumerate(parts[:-1]):
+            if part in {"track", "album", "playlist", "artist"}:
+                return part, parts[index + 1]
+        return None, None
+
+    @staticmethod
+    def is_spotify_link(url: str) -> bool:
+        if url.startswith("spotify:"):
+            return True
+        parsed = urlsplit(url if "://" in url else f"https://{url}")
+        host = (parsed.hostname or "").lower()
+        return host == "spotify.com" or host.endswith(".spotify.com")
 
     @staticmethod
     def _format_track(track: dict[str, Any]) -> str:
@@ -97,6 +181,99 @@ class YTDLSource(discord.PCMVolumeTransformer):
         except Exception:
             logger.exception("Could not resolve or open audio for query %r", query)
             return None
+
+    @classmethod
+    async def expand_youtube_link(cls, url: str) -> list[str]:
+        video_url = cls.youtube_video_url(url)
+        if video_url:
+            return [video_url]
+
+        loop = asyncio.get_running_loop()
+        try:
+            data = await loop.run_in_executor(
+                None,
+                lambda: YoutubeDL(YTDL_FORMAT_OPTIONS).extract_info(
+                    url, download=False
+                ),
+            )
+            if not data:
+                return []
+
+            entries = data.get("entries")
+            if entries is None:
+                return [url]
+
+            links = []
+            for entry in entries:
+                if not entry:
+                    continue
+                link = (
+                    entry.get("webpage_url")
+                    or entry.get("original_url")
+                    or entry.get("url")
+                )
+                if link and not link.startswith("http"):
+                    extractor = entry.get("extractor_key", "")
+                    if "youtube" in extractor.lower():
+                        link = f"https://www.youtube.com/watch?v={link}"
+                if link:
+                    links.append(link)
+            return links
+        except Exception:
+            logger.exception("Could not read YouTube link %r", url)
+            raise
+
+    @classmethod
+    async def resolve_title(cls, query: str) -> Optional[str]:
+        loop = asyncio.get_running_loop()
+        video_url = cls.youtube_video_url(query)
+        target = video_url or (
+            query if query.startswith("http") else f"ytsearch:{query}"
+        )
+        try:
+            data = await loop.run_in_executor(
+                None,
+                lambda: YoutubeDL(
+                    {**YTDL_FORMAT_OPTIONS, "noplaylist": True}
+                ).extract_info(target, download=False),
+            )
+            if data and data.get("entries") is not None:
+                data = next((entry for entry in data["entries"] if entry), None)
+            return data.get("title") if data else None
+        except Exception:
+            logger.exception("Could not resolve title for %r", query)
+            return None
+
+    @staticmethod
+    def youtube_video_url(url: str) -> Optional[str]:
+        parsed = urlsplit(url if "://" in url else f"https://{url}")
+        host = (parsed.hostname or "").lower()
+        video_id = None
+
+        if host == "youtu.be":
+            video_id = parsed.path.strip("/").split("/")[0]
+        elif host == "youtube.com" or host.endswith(".youtube.com"):
+            video_id = parse_qs(parsed.query).get("v", [None])[0]
+            if not video_id:
+                parts = [part for part in parsed.path.split("/") if part]
+                if len(parts) >= 2 and parts[0] in {"shorts", "embed", "live"}:
+                    video_id = parts[1]
+
+        if not video_id:
+            return None
+        return f"https://www.youtube.com/watch?v={video_id}"
+
+    @staticmethod
+    def is_youtube_link(url: str) -> bool:
+        parsed = urlsplit(url if "://" in url else f"https://{url}")
+        host = (parsed.hostname or "").lower()
+        return (
+            host == "youtu.be"
+            or host == "youtube.com"
+            or host.endswith(".youtube.com")
+            or host == "youtube-nocookie.com"
+            or host.endswith(".youtube-nocookie.com")
+        )
 
 
 class Music(commands.Cog):
@@ -203,95 +380,92 @@ class Music(commands.Cog):
             logger.error("Audio playback failed in guild %s: %s", guild_id, error)
         asyncio.run_coroutine_threadsafe(self.play_next(guild_id), self.bot.loop)
 
-    @app_commands.command(name="play", description="Plays music from search or link")
-    @app_commands.guild_only()
-    async def play(self, interaction: discord.Interaction, query: str) -> None:
-        await interaction.response.defer(thinking=True)
-        guild = interaction.guild
+    @commands.command(name="play", help="Play music from a search or link.")
+    @commands.guild_only()
+    async def play(self, ctx: commands.Context, *, query: str) -> None:
+        guild = ctx.guild
         if guild is None:
-            await interaction.followup.send(
-                "This command can only be used in a server."
-            )
             return
 
         guild_id = guild.id
-        self.text_channels[guild_id] = interaction.channel
+        self.text_channels[guild_id] = ctx.channel
 
-        voice_state = interaction.user.voice
+        voice_state = ctx.author.voice
         voice_client = guild.voice_client
         if voice_client is None and (
             voice_state is None or voice_state.channel is None
         ):
-            await interaction.followup.send(
-                "You are not in a voice channel.", ephemeral=True
-            )
+            await ctx.send("You are not in a voice channel.")
             return
         if voice_client and (
             voice_state is None or voice_state.channel != voice_client.channel
         ):
-            await interaction.followup.send(
-                "Join the bot's voice channel to play music.", ephemeral=True
-            )
+            await ctx.send("Join the bot's voice channel to play music.")
             return
 
+        is_link = SpotifyHelper.is_spotify_link(query) or YTDLSource.is_youtube_link(
+            query
+        )
         try:
-            if "open.spotify.com/" in query:
-                tracks = await self.bot.loop.run_in_executor(
+            if SpotifyHelper.is_spotify_link(query):
+                tracks = await asyncio.get_running_loop().run_in_executor(
                     None, self.spotify_helper.extract_tracks, query
                 )
                 if not tracks:
-                    await interaction.followup.send(
-                        "Could not extract tracks from the provided link."
+                    await ctx.send(
+                        "Could not find songs in that Spotify link."
                     )
+                    return
+            elif YTDLSource.is_youtube_link(query):
+                tracks = await YTDLSource.expand_youtube_link(query)
+                if not tracks:
+                    await ctx.send("Could not find videos in that YouTube link.")
                     return
             else:
                 tracks = [query]
         except Exception:
-            logger.exception("Could not extract Spotify tracks from %r", query)
-            await interaction.followup.send(
-                "Could not read tracks from the provided Spotify link."
+            logger.exception("Could not expand music link %r", query)
+            await ctx.send(
+                "Could not read songs from that link."
             )
             return
 
+        title = None
+        if len(tracks) == 1 and is_link:
+            title = await YTDLSource.resolve_title(tracks[0])
+
         async with self.get_lock(guild_id):
             voice_client = guild.voice_client
-            voice_state = interaction.user.voice
+            voice_state = ctx.author.voice
             if voice_client is None:
                 if voice_state is None or voice_state.channel is None:
-                    await interaction.followup.send(
-                        "You are not in a voice channel.", ephemeral=True
-                    )
+                    await ctx.send("You are not in a voice channel.")
                     return
                 voice_client = await voice_state.channel.connect(self_deaf=True)
             elif voice_state is None or voice_state.channel != voice_client.channel:
-                await interaction.followup.send(
-                    "Join the bot's voice channel to play music.", ephemeral=True
-                )
+                await ctx.send("Join the bot's voice channel to play music.")
                 return
 
             self.cancel_idle_disconnect(guild_id)
             self.queues.setdefault(guild_id, []).extend(tracks)
 
-        message = (
-            f"Added {len(tracks)} tracks to the queue."
-            if len(tracks) > 1
-            else f"Added `{query}` to the queue."
-        )
-        await interaction.followup.send(message)
+        if len(tracks) > 1:
+            message = f"Added {len(tracks)} songs to the queue."
+        elif title:
+            message = f"Added **{title}** to the queue."
+        else:
+            message = f"Added `{query}` to the queue."
+        await ctx.send(message)
         await self.play_next(guild_id)
 
-    @app_commands.command(name="stop", description="Stops music and clears the queue")
-    @app_commands.guild_only()
-    async def stop(self, interaction: discord.Interaction) -> None:
-        guild = interaction.guild
+    @commands.command(name="stop", help="Stop playback and clear the queue.")
+    @commands.guild_only()
+    async def stop(self, ctx: commands.Context) -> None:
+        guild = ctx.guild
         if guild is None:
-            await interaction.response.send_message(
-                "This command can only be used in a server.", ephemeral=True
-            )
             return
 
         guild_id = guild.id
-        await interaction.response.defer(thinking=True)
         voice_client = guild.voice_client
         async with self.get_lock(guild_id):
             self.queues[guild_id] = []
@@ -302,7 +476,24 @@ class Music(commands.Cog):
                     voice_client.stop()
                 await voice_client.disconnect()
 
-        await interaction.followup.send("Playback stopped and queue cleared.")
+        await ctx.send("Playback stopped and queue cleared.")
+
+    @commands.command(name="skip", help="Skip the currently playing track.")
+    @commands.guild_only()
+    async def skip(self, ctx: commands.Context) -> None:
+        guild = ctx.guild
+        if guild is None:
+            return
+
+        voice_client = guild.voice_client
+        if voice_client is None or not (
+            voice_client.is_playing() or voice_client.is_paused()
+        ):
+            await ctx.send("Nothing is currently playing.")
+            return
+
+        voice_client.stop()
+        await ctx.send("Skipped the current track.")
 
 
 async def setup(bot: commands.Bot) -> None:
@@ -312,5 +503,6 @@ async def setup(bot: commands.Bot) -> None:
     spotify_helper = SpotifyHelper(
         client_id=config["spotify_client_id"],
         client_secret=config["spotify_client_secret"],
+        market=config.get("spotify_market", "US"),
     )
     await bot.add_cog(Music(bot, spotify_helper))
