@@ -1,8 +1,3 @@
 config.json
 .cache
-<<<<<<< HEAD
 __pycache__/
-start.bat
-=======
-__pycache__/
->>>>>>> 4138195 (Add Shirokiq music bot)
