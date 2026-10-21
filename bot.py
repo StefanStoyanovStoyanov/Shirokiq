@@ -9,9 +9,7 @@ from discord.ext import commands
 class MusicBot(commands.Bot):
     async def setup_hook(self) -> None:
         await self.load_extension("cogs.music_cog")
-        self.command_count = sum(
-            len(cog.get_commands()) for cog in self.cogs.values()
-        )
+        self.command_count = sum(len(cog.get_commands()) for cog in self.cogs.values())
         self.startup_reported = False
 
     async def on_ready(self) -> None:
@@ -19,10 +17,8 @@ class MusicBot(commands.Bot):
             return
 
         self.startup_reported = True
-        print(
-            f"Ready on {len(self.guilds)} servers as {self.user.name}. "
-            f"Loaded {self.command_count} commands. "
-        )
+        print(f"Ready on {len(self.guilds)} servers as {self.user.name}!")
+        print(f"Loaded and synced {self.command_count} commands.")
 
 
 async def main():
