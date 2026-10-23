@@ -381,9 +381,40 @@ class Music(commands.Cog):
             logger.error("Audio playback failed in guild %s: %s", guild_id, error)
         asyncio.run_coroutine_threadsafe(self.play_next(guild_id), self.bot.loop)
 
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        if (
+            self.bot.user is None
+            or member.id != self.bot.user.id
+            or before.channel is None
+            or after.channel is not None
+        ):
+            return
+
+        guild_id = member.guild.id
+        async with self.get_lock(guild_id):
+            self.queues.pop(guild_id, None)
+            self.current.pop(guild_id, None)
+            self.cancel_idle_disconnect(guild_id)
+
     @commands.command(name="play", help="Play music from a search or link.")
     @commands.guild_only()
     async def play(self, ctx: commands.Context, *, query: str) -> None:
+        await self.enqueue(ctx, query)
+
+    @commands.command(name="playnext", help="Play a song or link next.")
+    @commands.guild_only()
+    async def playnext(self, ctx: commands.Context, *, query: str) -> None:
+        await self.enqueue(ctx, query, play_next=True)
+
+    async def enqueue(
+        self, ctx: commands.Context, query: str, *, play_next: bool = False
+    ) -> None:
         guild = ctx.guild
         if guild is None:
             return
@@ -448,14 +479,21 @@ class Music(commands.Cog):
                 return
 
             self.cancel_idle_disconnect(guild_id)
-            self.queues.setdefault(guild_id, []).extend(tracks)
+            queue = self.queues.setdefault(guild_id, [])
+            if play_next:
+                queue[0:0] = tracks
+            else:
+                queue.extend(tracks)
 
         if len(tracks) > 1:
-            message = f"Added {len(tracks)} songs to the queue."
+            action = "play next" if play_next else "the queue"
+            message = f"Added {len(tracks)} songs to {action}."
         elif title:
-            message = f"Added **{title}** to the queue."
+            action = "play next" if play_next else "the queue"
+            message = f"Added **{title}** to {action}."
         else:
-            message = f"Added `{query}` to the queue."
+            action = "play next" if play_next else "the queue"
+            message = f"Added `{query}` to {action}."
         await ctx.send(message)
         await self.play_next(guild_id)
 
