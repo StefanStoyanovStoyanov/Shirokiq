@@ -555,7 +555,7 @@ class Music(commands.Cog):
 
 async def setup(bot: commands.Bot) -> None:
     config_path = Path(__file__).resolve().parent.parent / "config.json"
-    with config_path.open(encoding="utf-8") as config_file:
+    with config_path.open(encoding="utf-8-sig") as config_file:
         config = json.load(config_file)
     spotify_helper = SpotifyHelper(
         client_id=config["spotify_client_id"],

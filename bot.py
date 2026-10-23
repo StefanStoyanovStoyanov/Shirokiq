@@ -23,7 +23,7 @@ class MusicBot(commands.Bot):
 
 async def main():
     config_path = Path(__file__).with_name("config.json")
-    with config_path.open(encoding="utf-8") as config_file:
+    with config_path.open(encoding="utf-8-sig") as config_file:
         config = json.load(config_file)
 
     token = config.get("discord_token")
