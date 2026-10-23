@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import random
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlsplit
@@ -457,6 +458,24 @@ class Music(commands.Cog):
             message = f"Added `{query}` to the queue."
         await ctx.send(message)
         await self.play_next(guild_id)
+
+    @commands.command(name="shuffle", help="Shuffle the songs waiting in the queue.")
+    @commands.guild_only()
+    async def shuffle(self, ctx: commands.Context) -> None:
+        guild = ctx.guild
+        if guild is None:
+            return
+
+        async with self.get_lock(guild.id):
+            queue = self.queues.get(guild.id, [])
+            if len(queue) < 2:
+                await ctx.send("Add at least two songs to the queue to shuffle it.")
+                return
+
+            random.shuffle(queue)
+            track_count = len(queue)
+
+        await ctx.send(f"Shuffled {track_count} songs in the queue.")
 
     @commands.command(name="stop", help="Stop playback and clear the queue.")
     @commands.guild_only()
